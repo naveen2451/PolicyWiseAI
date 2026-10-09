@@ -55,3 +55,9 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Local development configuration
+**/appsettings.Development.json
+**/appsettings.Local.json
+backend/PolicyWise.Api/appsettings.Development.json
+backend/PolicyWise.Api/appsettings.json
