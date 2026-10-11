@@ -61,3 +61,15 @@ nunit-*.xml
 **/appsettings.Local.json
 backend/PolicyWise.Api/appsettings.Development.json
 backend/PolicyWise.Api/appsettings.json
+testfiles/*.json
+tesfiles/chunks-run1.json
+tesfiles/chunks-run2.json
+.gitignore
+tesfiles/chunks-runnew.json
+.gitignore
+tesfiles/chunks-run3.json
+.gitignore
+tesfiles/document-analysis.json
+.gitignore
+tesfiles/extracted-document.json
+tesfiles/chunks.json
