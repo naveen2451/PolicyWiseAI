@@ -1,13 +1,22 @@
+using System.Diagnostics;
 using Azure;
 using Azure.Identity;
 using Azure.Search.Documents.Indexes;
 using Azure.Storage.Blobs;
+using PolicyWise.Api.Models;
+using PolicyWise.Application.Answers;
 using PolicyWise.Application.Chunking;
 using PolicyWise.Application.Chunking.Citations;
 using PolicyWise.Application.Chunking.Splitting;
 using PolicyWise.Application.Documents;
+using PolicyWise.Application.Embeddings;
+using PolicyWise.Application.Evidence;
 using PolicyWise.Application.Extraction;
+using PolicyWise.Application.Search;
+using PolicyWise.Infrastructure.AI;
+using PolicyWise.Infrastructure.Embeddings;
 using PolicyWise.Infrastructure.Extraction;
+using PolicyWise.Infrastructure.Search;
 using PolicyWise.Infrastructure.Storage;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -40,6 +49,106 @@ builder.Services.AddSingleton<IContentBlockSplitter, ContentBlockSplitter>();
 
 builder.Services.AddSingleton<IPageNumberResolver, PageNumberResolver>();
 
+builder.Services.AddSingleton<ITextEmbeddingGenerator>(sp =>
+{
+    Console.WriteLine("1. Creating embedding generator");
+
+    var configuration = sp.GetRequiredService<IConfiguration>();
+
+    var endpoint = configuration["Embeddings:Endpoint"]!;
+    var deployment = configuration["Embeddings:DeploymentName"]!;
+
+    Console.WriteLine("2. Configuration loaded");
+
+    var generator = new AzureOpenAIEmbeddingGenerator(endpoint, deployment);
+
+    Console.WriteLine("3. Embedding generator created");
+
+    return generator;
+});
+
+builder.Services.AddSingleton(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+
+    var endpoint =
+        configuration["Azure:Search:Endpoint"]
+        ?? throw new InvalidOperationException("Azure Search endpoint is missing.");
+
+    return new PolicyWiseSearchIndexManager(endpoint);
+});
+
+builder.Services.AddSingleton<ISearchDocumentIndexer>(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+
+    var endpoint =
+        configuration["Azure:Search:Endpoint"]
+        ?? throw new InvalidOperationException("Azure Search endpoint missing");
+
+    var indexName =
+        configuration["Azure:Search:IndexName"]
+        ?? throw new InvalidOperationException("Azure Search index name missing");
+
+    return new AzureSearchDocumentIndexer(endpoint, indexName);
+});
+
+builder.Services.AddScoped<DocumentEmbeddingService>();
+
+builder.Services.AddSingleton<IDocumentRetriever>(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+
+    var endpoint =
+        configuration["Azure:Search:Endpoint"]
+        ?? throw new InvalidOperationException("Search endpoint missing");
+
+    var indexName =
+        configuration["Azure:Search:IndexName"]
+        ?? throw new InvalidOperationException("Search index name missing");
+
+    var logger = sp.GetRequiredService<ILogger<AzureSearchDocumentRetriever>>();
+
+    return new AzureSearchDocumentRetriever(endpoint, indexName, logger);
+});
+
+builder.Services.AddScoped<DocumentRetrievalService>();
+
+builder.Services.AddSingleton<IEvidenceValidator>(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+
+    var endpoint =
+        configuration["EvidenceValidation:Endpoint"]
+        ?? throw new InvalidOperationException("Evidence validation endpoint is missing.");
+
+    var deployment =
+        configuration["EvidenceValidation:DeploymentName"]
+        ?? throw new InvalidOperationException("Evidence validation deployment is missing.");
+
+    var logger = sp.GetRequiredService<ILogger<AzureOpenAiEvidenceValidator>>();
+
+    return new AzureOpenAiEvidenceValidator(endpoint, deployment, logger);
+});
+
+builder.Services.AddSingleton<IAnswerGenerator>(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+
+    var endpoint =
+        configuration["EvidenceValidation:Endpoint"]
+        ?? throw new InvalidOperationException("Azure OpenAI endpoint is missing.");
+
+    var deployment =
+        configuration["EvidenceValidation:DeploymentName"]
+        ?? throw new InvalidOperationException("Azure OpenAI chat deployment is missing.");
+
+    var logger = sp.GetRequiredService<ILogger<AzureOpenAiAnswerGenerator>>();
+
+    return new AzureOpenAiAnswerGenerator(endpoint, deployment, logger);
+});
+
+builder.Services.AddScoped<PolicyQuestionAnswerService>();
 var app = builder.Build();
 
 // Simple routing test
@@ -207,8 +316,6 @@ if (app.Environment.IsDevelopment())
                 return Results.BadRequest("Only PDFs are supported.");
             }
 
-            await using var stream = await blobReader.OpenReadAsync(blobPath, cancellationToken);
-
             await using var blobStream = await blobReader.OpenReadAsync(
                 blobPath,
                 cancellationToken
@@ -263,6 +370,303 @@ if (app.Environment.IsDevelopment())
             );
         }
     );
-}
+    app.MapPost(
+        "/api/dev/embeddings/test",
+        async (
+            EmbeddingTestRequest request,
+            ITextEmbeddingGenerator generator,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.Text))
+                return Results.BadRequest("Text is required.");
 
+            Console.WriteLine("4. Calling embedding model");
+
+            var embedding = await generator.GenerateAsync(request.Text, cancellationToken);
+
+            Console.WriteLine($"5. Embedding received: {embedding.Length}");
+
+            return Results.Ok(
+                new
+                {
+                    Dimensions = embedding.Length,
+                    FirstFiveValues = embedding.Span[..Math.Min(5, embedding.Length)].ToArray(),
+                }
+            );
+        }
+    );
+    app.MapPost(
+        "/api/dev/embeddings/compare",
+        async (ITextEmbeddingGenerator generator, CancellationToken ct) =>
+        {
+            var query = "Does my car insurance cover a broken windscreen?";
+
+            var documents = new[]
+            {
+                "The policy covers accidental damage to the vehicle's windscreen.",
+                "The insurer will pay for broken or cracked car glass.",
+                "Life insurance provides a lump sum payment upon death.",
+            };
+
+            var queryVector = await generator.GenerateAsync(query, ct);
+
+            var results = new List<object>();
+
+            foreach (var document in documents)
+            {
+                var documentVector = await generator.GenerateAsync(document, ct);
+
+                var score = CosineSimilarity.Calculate(queryVector.Span, documentVector.Span);
+
+                results.Add(new { Document = document, Similarity = Math.Round(score, 4) });
+            }
+
+            return Results.Ok(results);
+        }
+    );
+
+    app.MapPost(
+        "/api/dev/search/create-index",
+        async (
+            PolicyWiseSearchIndexManager indexManager,
+            IConfiguration configuration,
+            CancellationToken ct
+        ) =>
+        {
+            var indexName =
+                configuration["Azure:Search:IndexName"]
+                ?? throw new InvalidOperationException("Search index name is missing.");
+
+            await indexManager.CreateIndexAsync(indexName, ct);
+
+            return Results.Ok(
+                new { Message = "Azure AI Search index created or updated", IndexName = indexName }
+            );
+        }
+    );
+    app.MapPost(
+        "/api/dev/documents/ingest",
+        async (
+            string blobPath,
+            IBlobDocumentReader blobReader,
+            IDocumentTextExtractor extractor,
+            IDocumentChunker chunker,
+            DocumentEmbeddingService embeddingService,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            // 1. Validate the blob path
+            if (
+                !blobPath.StartsWith("car/", StringComparison.OrdinalIgnoreCase)
+                && !blobPath.StartsWith("life/", StringComparison.OrdinalIgnoreCase)
+            )
+            {
+                return Results.BadRequest("Invalid document path.");
+            }
+
+            if (!blobPath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.BadRequest("Only PDFs are supported.");
+            }
+
+            // 2. Read the PDF from Azure Blob Storage
+            await using var blobStream = await blobReader.OpenReadAsync(
+                blobPath,
+                cancellationToken
+            );
+
+            using var documentStream = new MemoryStream();
+
+            await blobStream.CopyToAsync(documentStream, cancellationToken);
+
+            documentStream.Position = 0;
+
+            // 3. Calculate source document version
+            var sourceVersion = await DocumentVersionCalculator.CalculateAsync(
+                documentStream,
+                cancellationToken
+            );
+
+            // Ensure the extractor reads from the beginning
+            documentStream.Position = 0;
+
+            // 4. Extract Markdown using Document Intelligence
+            var extractedDocument = await extractor.ExtractAsync(
+                documentId: blobPath,
+                blobPath: blobPath,
+                policyType: blobPath.Split('/')[0],
+                documentStream: documentStream,
+                cancellationToken: cancellationToken
+            );
+
+            // 5. Attach the document version
+            var versionedDocument = extractedDocument with
+            {
+                SourceVersion = sourceVersion,
+            };
+
+            // 6. Generate document chunks
+            var chunks = chunker.Chunk(versionedDocument);
+
+            // 7. Generate embeddings and upload to Azure AI Search
+            var indexedCount = await embeddingService.ProcessAsync(chunks, cancellationToken);
+
+            // 8. Return ingestion summary
+            return Results.Ok(
+                new
+                {
+                    DocumentId = extractedDocument.DocumentId,
+                    BlobPath = blobPath,
+                    SourceVersion = sourceVersion,
+                    TotalPages = extractedDocument.Pages.Count(),
+                    TotalChunks = chunks.Count,
+                    IndexedChunks = indexedCount,
+                    Message = "Document indexed successfully",
+                }
+            );
+        }
+    );
+    app.MapGet(
+        "/api/dev/search/vector",
+        async (
+            string question,
+            int? topK,
+            string? policyType,
+            DocumentRetrievalService retrievalService,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            if (string.IsNullOrWhiteSpace(question))
+                return Results.BadRequest("Question is required.");
+
+            if (topK is < 1 or > 50)
+                return Results.BadRequest("topK must be between 1 and 50.");
+
+            var results = await retrievalService.SearchAsync(
+                question,
+                topK ?? 5,
+                policyType,
+                cancellationToken
+            );
+
+            return Results.Ok(
+                new
+                {
+                    Question = question,
+                    SearchType = "Vector",
+                    TotalResults = results.Count,
+                    Results = results.Select(
+                        (result, index) =>
+                            new
+                            {
+                                Rank = index + 1,
+                                result.Score,
+                                result.DocumentId,
+                                result.PolicyType,
+                                result.SectionTitle,
+                                result.PageNumbers,
+                                result.Content,
+                            }
+                    ),
+                }
+            );
+        }
+    );
+    app.MapGet(
+        "/api/dev/evidence/validate",
+        async (
+            string question,
+            string? policyType,
+            int? topK,
+            DocumentRetrievalService retrievalService,
+            IEvidenceValidator evidenceValidator,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            if (string.IsNullOrWhiteSpace(question))
+                return Results.BadRequest("Question is required.");
+
+            if (topK is < 1 or > 20)
+                return Results.BadRequest("topK must be between 1 and 20.");
+
+            var stopwatch = Stopwatch.StartNew();
+
+            // Step 1: Retrieve candidate chunks using HYBRID search.
+            var chunks = await retrievalService.SearchAsync(
+                question,
+                topK ?? 5,
+                policyType,
+                cancellationToken
+            );
+
+            // Step 2: Ask the LLM whether the evidence is sufficient.
+            var validation = await evidenceValidator.ValidateAsync(
+                question,
+                chunks,
+                cancellationToken
+            );
+
+            stopwatch.Stop();
+
+            return Results.Ok(
+                new
+                {
+                    Question = question,
+                    RetrievalMode = "Hybrid",
+                    RetrievedChunks = chunks.Count,
+                    Validation = new
+                    {
+                        Status = validation.Status.ToString(),
+                        validation.SupportingChunkIds,
+                        validation.Reason,
+                    },
+                    RetrievedEvidence = chunks.Select(
+                        (chunk, index) =>
+                            new
+                            {
+                                Rank = index + 1,
+                                chunk.ChunkId,
+                                chunk.DocumentId,
+                                chunk.SectionTitle,
+                                chunk.PageNumbers,
+                                chunk.Score,
+                                IsSupportingEvidence = validation.SupportingChunkIds.Contains(
+                                    chunk.ChunkId
+                                ),
+                            }
+                    ),
+                    TotalDurationMs = stopwatch.ElapsedMilliseconds,
+                }
+            );
+        }
+    );
+
+    app.MapGet(
+        "/api/dev/ask",
+        async (
+            string question,
+            string? policyType,
+            int? topK,
+            PolicyQuestionAnswerService answerService,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            if (string.IsNullOrWhiteSpace(question))
+                return Results.BadRequest("Question is required.");
+
+            if (topK is < 1 or > 20)
+                return Results.BadRequest("topK must be between 1 and 20.");
+
+            var result = await answerService.AskAsync(
+                question,
+                policyType,
+                topK ?? 5,
+                cancellationToken
+            );
+
+            return Results.Ok(result);
+        }
+    );
+}
 app.Run();
