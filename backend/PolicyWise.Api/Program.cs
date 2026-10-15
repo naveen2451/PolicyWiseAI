@@ -1,20 +1,26 @@
 using System.Diagnostics;
+using System.Net.Http.Headers;
+using System.Text.Json;
 using Azure;
+using Azure.Core;
 using Azure.Identity;
 using Azure.Search.Documents.Indexes;
 using Azure.Storage.Blobs;
 using PolicyWise.Api.Models;
 using PolicyWise.Application.Answers;
+using PolicyWise.Application.Answers.Verification;
 using PolicyWise.Application.Chunking;
 using PolicyWise.Application.Chunking.Citations;
 using PolicyWise.Application.Chunking.Splitting;
 using PolicyWise.Application.Documents;
 using PolicyWise.Application.Embeddings;
+using PolicyWise.Application.Evaluation;
 using PolicyWise.Application.Evidence;
 using PolicyWise.Application.Extraction;
 using PolicyWise.Application.Search;
 using PolicyWise.Infrastructure.AI;
 using PolicyWise.Infrastructure.Embeddings;
+using PolicyWise.Infrastructure.Evaluation;
 using PolicyWise.Infrastructure.Extraction;
 using PolicyWise.Infrastructure.Search;
 using PolicyWise.Infrastructure.Storage;
@@ -149,6 +155,27 @@ builder.Services.AddSingleton<IAnswerGenerator>(sp =>
 });
 
 builder.Services.AddScoped<PolicyQuestionAnswerService>();
+
+builder.Services.AddSingleton<IAnswerGroundingVerifier>(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+
+    var endpoint =
+        configuration["EvidenceValidation:Endpoint"]
+        ?? throw new InvalidOperationException("Azure OpenAI endpoint is missing.");
+
+    var deployment =
+        configuration["EvidenceValidation:DeploymentName"]
+        ?? throw new InvalidOperationException("Azure OpenAI deployment is missing.");
+
+    var logger = sp.GetRequiredService<ILogger<AzureOpenAiAnswerGroundingVerifier>>();
+
+    return new AzureOpenAiAnswerGroundingVerifier(endpoint, deployment, logger);
+});
+
+builder.Services.AddHttpClient<IRagEvaluationService, FoundryRagEvaluationService>();
+
+builder.Services.AddSingleton<TokenCredential>(_ => new AzureCliCredential());
 var app = builder.Build();
 
 // Simple routing test
@@ -668,5 +695,162 @@ if (app.Environment.IsDevelopment())
             return Results.Ok(result);
         }
     );
+    //custom groundness
+    app.MapPost(
+        "/api/dev/grounding/verify",
+        async (
+            GroundingTestRequest request,
+            DocumentRetrievalService retrievalService,
+            IAnswerGroundingVerifier groundingVerifier,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            if (
+                string.IsNullOrWhiteSpace(request.Question)
+                || string.IsNullOrWhiteSpace(request.Answer)
+            )
+            {
+                return Results.BadRequest("Question and answer are required.");
+            }
+
+            if (request.TopK is < 1 or > 20)
+            {
+                return Results.BadRequest("TopK must be between 1 and 20.");
+            }
+
+            // Retrieve real policy evidence using hybrid search.
+            var chunks = await retrievalService.SearchAsync(
+                request.Question,
+                request.TopK,
+                request.PolicyType,
+                cancellationToken
+            );
+
+            // Use only the explicitly selected chunk as cited evidence.
+            var citedChunks = chunks
+                .Where(chunk => chunk.ChunkId == request.CitedChunkId)
+                .ToArray();
+
+            if (citedChunks.Length == 0)
+            {
+                return Results.BadRequest("CitedChunkId must match a chunk returned by retrieval.");
+            }
+
+            var verification = await groundingVerifier.VerifyAsync(
+                request.Question,
+                request.Answer,
+                citedChunks,
+                cancellationToken
+            );
+
+            return Results.Ok(
+                new
+                {
+                    verification.Status,
+                    verification.UnsupportedClaims,
+                    verification.Reason,
+                    CitedEvidence = citedChunks.Select(chunk => new
+                    {
+                        chunk.ChunkId,
+                        chunk.DocumentId,
+                        chunk.SectionTitle,
+                        chunk.PageNumbers,
+                    }),
+                }
+            );
+        }
+    );
+    //Foundary Groundness
+
+    app.MapGet(
+        "/api/dev/foundry/configuration",
+        async (IConfiguration configuration, CancellationToken cancellationToken) =>
+        {
+            var endpoint = configuration["FoundryEvaluation:ProjectEndpoint"];
+
+            var evaluationId = configuration["FoundryEvaluation:EvaluationId"];
+
+            if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(evaluationId))
+            {
+                return Results.BadRequest("Foundry project endpoint or evaluation ID is missing.");
+            }
+
+            var credential = new AzureCliCredential();
+
+            var accessToken = await credential.GetTokenAsync(
+                new TokenRequestContext(new[] { "https://ai.azure.com/.default" }),
+                cancellationToken
+            );
+
+            using var client = new HttpClient();
+
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+                "Bearer",
+                accessToken.Token
+            );
+
+            var url =
+                $"{endpoint.TrimEnd('/')}/openai/v1/evals/" + Uri.EscapeDataString(evaluationId);
+
+            //var url = $"{endpoint.TrimEnd('/')}/openai/v1/evals?limit=100";
+
+            using var response = await client.GetAsync(url, cancellationToken);
+
+            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            Console.WriteLine("=== FOUNDRY EVALUATION CONFIGURATION ===");
+
+            // Development only. Inspect before sharing externally.
+            Console.WriteLine(responseBody);
+
+            return Results.Content(
+                responseBody,
+                "application/json",
+                statusCode: (int)response.StatusCode
+            );
+        }
+    );
+
+    app.MapPost(
+        "/api/dev/foundry/evaluate",
+        async (
+            FoundryEvaluationRequest request,
+            IRagEvaluationService evaluator,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            var result = await evaluator.SubmitAsync(
+                new RagEvaluationInput(request.Query, request.Context, request.Response),
+                cancellationToken
+            );
+
+            return Results.Ok(result);
+        }
+    );
+    app.MapGet(
+        "/api/dev/foundry/evaluate/{runId}",
+        async (
+            string runId,
+            IRagEvaluationService evaluator,
+            CancellationToken cancellationToken
+        ) =>
+        {
+            var result = await evaluator.GetResultAsync(runId, cancellationToken);
+
+            var metrics = FoundryEvaluationResultParser.Parse(result);
+
+            return Results.Ok(metrics);
+        }
+    );
 }
 app.Run();
+
+public sealed record GroundingTestRequest(
+    string Question,
+    string Answer,
+    string CitedChunkId,
+    string? PolicyType = "car",
+    int TopK = 5
+);
+
+public sealed record FoundryEvaluationRequest(string Query, string Context, string Response);
